@@ -1,0 +1,245 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wiiu-wake-esp32</title>
+<style>
+:root{color-scheme:light dark;--bg:#f4f5f7;--card:#fff;--text:#1c1f23;--muted:#667;--line:#e2e5e9;--accent:#0a7bbd;--ok:#14803c;--bad:#c02b2b;--warn:#a76500}
+@media (prefers-color-scheme:dark){:root{--bg:#14171a;--card:#1e2226;--text:#eceff1;--muted:#99a3ad;--line:#2f353b;--accent:#3aa6e0;--ok:#4cc26f;--bad:#ef6a6a;--warn:#e0a53c}}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:460px;margin:0 auto}
+h1{font-size:1.3rem;margin:8px 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px}
+.buttons{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button{font:inherit;font-weight:600;padding:14px 8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.5;cursor:not-allowed}
+#msg{margin-top:12px;min-height:1.45em;overflow-wrap:anywhere}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.muted{color:var(--muted)}
+dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}
+dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}
+label{display:block;font-weight:600;margin-bottom:6px}
+.row{display:flex;gap:8px}
+input{flex:1;min-width:0;font:inherit;padding:10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+.row button{padding:10px 14px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+<h1>wiiu-wake-esp32</h1>
+
+<section class="card" id="tokenCard" hidden>
+  <form id="tokenForm">
+    <label for="token">Access token</label>
+    <div class="row">
+      <input id="token" type="password" autocomplete="current-password">
+      <button type="submit">Save</button>
+    </div>
+  </form>
+  <div id="tokenMsg" class="bad"></div>
+</section>
+
+<section class="card">
+  <div class="buttons">
+    <button id="wake" class="primary" disabled>Wake</button>
+    <button id="sync" disabled>Sync</button>
+  </div>
+  <div id="msg" class="muted" role="status" aria-live="polite">Loading status…</div>
+</section>
+
+<section class="card">
+  <dl>
+    <dt>Device</dt><dd id="device">–</dd>
+    <dt>Console</dt><dd id="paired">–</dd>
+    <dt>Link</dt><dd id="link">–</dd>
+    <dt>Last wake</dt><dd id="lastWake">–</dd>
+    <dt>Bluetooth</dt><dd id="bdaddr">–</dd>
+    <dt>Wi-Fi</dt><dd id="ip">–</dd>
+  </dl>
+</section>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const POLL_MS = 2000;
+const WAKE_TIMEOUT_MS = 90000;
+
+let token = "";
+try { token = localStorage.getItem("token") || ""; } catch (e) {}
+
+let info = null;
+let action = null; /* "wake" | "sync" | null: the action whose outcome is being followed */
+let actionStart = 0;
+let wakeBefore = 0;
+let pollTimer = 0;
+
+function setMsg(text, cls) {
+  $("msg").textContent = text;
+  $("msg").className = cls || "";
+}
+
+function headers() {
+  return token ? { Authorization: "Bearer " + token } : {};
+}
+
+function ago(ms) {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + " s ago";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  return Math.round(s / 3600) + " h ago";
+}
+
+function wakeText(i) {
+  const r = i.last_wake.result;
+  if (r === "none") return "Not since start";
+  const when = ago(i.uptime_ms - i.last_wake.time_ms);
+  if (i.wake_state === "waking") return "Connecting…";
+  if (i.wake_state === "verifying") return "Signal sent, checking…";
+  if (i.wake_state === "on") return "Console is on, " + when;
+  if (i.wake_state === "unconfirmed") return "Not confirmed, " + when;
+  if (r === "done") return "Signal sent, " + when;
+  return "Failed (" + r.replace("failed_", "") + "), " + when;
+}
+
+function render() {
+  const i = info;
+  if (!i) {
+    $("wake").disabled = $("sync").disabled = true;
+    return;
+  }
+  $("device").textContent = "Online";
+  $("device").className = "ok";
+  $("paired").textContent = i.paired ? i.console : "Not paired";
+  $("paired").className = i.paired ? "" : "warn";
+  $("link").textContent = i.syncing ? "Sync window open (" + i.sync_left_s + " s left)"
+    : i.connected ? "Connected to console" : "Idle";
+  $("lastWake").textContent = wakeText(i);
+  $("bdaddr").textContent = i.bdaddr;
+  $("ip").textContent = i.ip + (i.rssi ? " (" + i.rssi + " dBm)" : "");
+  const busy = i.connected || i.wake_state === "waking" || i.wake_state === "verifying";
+  $("wake").disabled = !i.paired || i.syncing || busy || action === "wake";
+  $("sync").disabled = i.syncing || busy || action === "sync";
+}
+
+function follow() {
+  const i = info;
+  if (action === "wake") {
+    const r = i.last_wake.result;
+    const current = i.last_wake.time_ms >= wakeBefore;
+    if (current && i.wake_state === "on") {
+      setMsg("The console is on.", "ok");
+      action = null;
+    } else if (current && i.wake_state === "unconfirmed") {
+      setMsg("Wake signal sent, but the console did not answer in time. It may still be starting, or it may be off.", "warn");
+      action = null;
+    } else if (current && i.wake_state === "verifying") {
+      setMsg("Wake signal sent. Checking that the console came up, this can take up to a minute…", "muted");
+    } else if (current && r.startsWith("failed_")) {
+      setMsg("Could not reach the console (" + r.replace("failed_", "HCI status ") + "). Is it plugged in and in range?", "bad");
+      action = null;
+    } else if (Date.now() - actionStart > WAKE_TIMEOUT_MS) {
+      setMsg("No result from the device.", "bad");
+      action = null;
+    }
+  } else if (i.wake_state === "waking" || i.wake_state === "verifying") {
+    action = "wake"; /* started elsewhere, or the page was reloaded */
+    actionStart = Date.now();
+    wakeBefore = 0;
+    follow();
+  } else if (action === "sync") {
+    if (i.syncing) {
+      setMsg("Press the red SYNC button on the console now (" + i.sync_left_s + " s left).", "warn");
+    } else if (i.last_sync === "paired") {
+      setMsg("Paired with the console.", "ok");
+      action = null;
+    } else if (i.last_sync === "timeout") {
+      setMsg("No console paired. Try again and press the red SYNC button on the console.", "bad");
+      action = null;
+    }
+  } else if (i.syncing) {
+    action = "sync"; /* started elsewhere, or the page was reloaded */
+    follow();
+  } else if ($("msg").textContent === "Loading status…") {
+    setMsg(i.paired ? "Ready." : "Not paired yet. Press Sync, then the red SYNC button on the console.", "muted");
+  }
+}
+
+function authNeeded(message) {
+  $("tokenCard").hidden = false;
+  $("tokenMsg").textContent = message;
+  setMsg("Enter the access token to continue.", "warn");
+}
+
+async function poll() {
+  clearTimeout(pollTimer);
+  try {
+    const res = await fetch("/info", { headers: headers(), cache: "no-store" });
+    if (res.status === 401) {
+      info = null;
+      authNeeded(token ? "This token was not accepted." : "");
+    } else if (!res.ok) {
+      throw new Error("HTTP " + res.status);
+    } else {
+      info = await res.json();
+      $("tokenCard").hidden = true;
+      follow();
+    }
+  } catch (e) {
+    info = null;
+    $("device").textContent = "Offline";
+    $("device").className = "bad";
+    setMsg("Cannot reach the device. Retrying…", "bad");
+  }
+  render();
+  pollTimer = setTimeout(poll, action ? 500 : POLL_MS);
+}
+
+async function post(path) {
+  const res = await fetch(path, { method: "POST", headers: headers() });
+  let body = {};
+  try { body = await res.json(); } catch (e) {}
+  return { status: res.status, body };
+}
+
+async function start(name, path, waitingText) {
+  action = name;
+  actionStart = Date.now();
+  wakeBefore = info ? info.uptime_ms : 0;
+  setMsg(waitingText, "muted");
+  render();
+  try {
+    const { status, body } = await post(path);
+    if (status === 401) {
+      action = null;
+      authNeeded(token ? "This token was not accepted." : "");
+    } else if (status >= 400) {
+      action = null;
+      const reasons = { "no console paired": "No console is paired yet. Press Sync first.", "busy": "The device is busy. Try again in a moment." };
+      setMsg(reasons[body.error] || ("Request failed (HTTP " + status + ")."), "bad");
+    }
+  } catch (e) {
+    action = null;
+    setMsg("Cannot reach the device.", "bad");
+  }
+  poll();
+}
+
+$("wake").addEventListener("click", () => start("wake", "/wake", "Sending wake signal…"));
+$("sync").addEventListener("click", () => start("sync", "/sync", "Opening sync window…"));
+$("tokenForm").addEventListener("submit", e => {
+  e.preventDefault();
+  token = $("token").value.trim();
+  try { localStorage.setItem("token", token); } catch (err) {}
+  $("tokenMsg").textContent = "";
+  setMsg("Loading status…", "muted");
+  poll();
+});
+poll();
+</script>
+</body>
+</html>
